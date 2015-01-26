@@ -1,0 +1,196 @@
+---
+title: "Practical Machine Learning / Prediction Assignment"
+author: "Ricardo Gutierrez"
+date: "01/25/2015"
+output: html_document
+---
+
+## Background
+
+
+Using devices such as Jawbone Up, Nike FuelBand, and Fitbit it is now possible 
+to collect a large amount of data about personal activity relatively 
+inexpensively. These type of devices are part of the quantified self movement 
+Â– a group of enthusiasts who take measurements about themselves regularly to 
+improve their health, to find patterns in their behavior, or because they are 
+tech geeks.
+
+One thing that people regularly do is quantify how much of a particular activity
+they do, but they rarely quantify how well they do it. In this data set, the 
+participants were asked to perform barbell lifts correctly and incorrectly in 5 
+different ways. More information is available from the website 
+here: http://groupware.les.inf.puc-rio.br/har (see the section on the Weight 
+Lifting Exercise Dataset).
+
+In this project, the goal will be to use data from accelerometers on the belt, 
+forearm, arm, and dumbell of 6 participants to predict the manner in which 
+praticipants did the exercise. The dependent variable or response is the “classe”
+variable in the training set. 
+
+## Getting and Cleaning Data
+Let's download the data from the web and mark missing values with "NA":
+```{r download}
+library(data.table)
+
+if (!file.exists("./data/pml-training.csv")) {
+  fileUrl <- "https://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv"
+  download.file(fileUrl,destfile = "data/pml-training.csv")
+}
+if (!file.exists("./data/pml-testing.csv")) {
+  fileUrl <- "https://d396qusza40orc.cloudfront.net/predmachlearn/pml-testing.csv"
+  download.file(fileUrl,destfile="data/pml-testing.csv")
+}
+
+training <- fread("data/pml-training.csv",na.strings=c("","NA","NULL","#DIV/0!"))
+testing  <- fread("data/pml-testing.csv",na.strings=c("","NA","NULL","#DIV/0!"))
+```
+
+Now let's clean up the testing dataset in order to avoid any missing values looking
+for good predictors candidates.
+
+```{r cleaning}
+MissingValues <- sapply(testing, function (x) any(is.na(x) | x == ""))
+predictors <- !MissingValues & grepl("belt|[^(fore)]arm|dumbbell|forearm", names(MissingValues))
+candidates <- names(MissingValues)[predictors]
+```
+
+With the predictor candidates defined, let's include them into the training dataset
+to make some factors with the 'classe' variable.
+
+```{r factors}
+include <- c("classe", candidates)
+training <- training[, include, with=FALSE]
+dim(training)
+names(training)
+training <- training[, classe := factor(training[, classe])]
+training[, .N, classe]
+```
+## Preprocessing Data
+
+To properly assess model performance, we separate our data set (the contents of pml-training.csv) into a training set containing 60% of the data, and a probing set containing 40% of the data.
+
+
+```{r sets}
+library(caret)
+
+seed <- (337737)
+set.seed(seed)
+#Partition rows into training and crossvalidation
+inTrain <- createDataPartition(training$classe, p=0.6)
+Train <- training[inTrain[[1]]]
+Probe <- training[-inTrain[[1]]]
+```
+
+Now, let's ’preprocess’ the prediction and validation variables by centering and 
+scaling the data to imput some of the missing values using a trained bagged tree
+to predict the missing values:
+```{r prepro}
+X <- Train[, candidates, with=FALSE]
+pp <- preProcess(X)
+pp
+XCS <- predict(pp, X)
+TrainCS <- data.table(data.frame(classe = Train[, classe], XCS))
+X <- Probe[, candidates, with=FALSE]
+XCS <- predict(pp, X)
+ProbeCS <- data.table(data.frame(classe = Probe[, classe], XCS))
+```
+
+Use the ‘nearZeroVar’ function from the caret package to diagnose not useful predictors (i.e. predictors that have few unique values relative to the number of samples or the ratio of the frequency of the most common value to the frequency of the second most common value is large). 
+```{r zerovar}
+nzv <- nearZeroVar(TrainCS, saveMetrics=TRUE)
+if (any(nzv$nzv)) nzv else message("No variables with near zero variance")
+```
+
+Examine groups of prediction variables:
+```{r histo}
+histGroup <- function (data, regex) {
+  col <- grep(regex, names(data))
+  col <- c(col, which(names(data) == "classe"))
+  library(reshape2)
+  n <- nrow(data)
+  Melted <- melt(data[, col, with=FALSE][, rownum := seq(1, n)], id.vars=c("rownum", "classe"))
+  library(ggplot2)
+  ggplot(Melted, aes(x=classe, y=value)) +
+    geom_violin(aes(color=classe, fill=classe), alpha=3/7) +
+    facet_wrap(~ variable, scale="free_y") +
+    labs(x="", y="") +
+    theme(legend.position="none")
+}
+histGroup(TrainCS, "belt")
+histGroup(TrainCS, "[^(fore)]arm")
+histGroup(TrainCS, "dumbbell")
+histGroup(TrainCS, "forearm")
+```
+
+## Training a Prediction Model
+Next, using the tidy dataset created by the ‘preProcessDataFrame’ function, It was trained a random forest classifier. Random forests are one on a diverse range of classifiers, each one with its pros and cons. As stated in [1], one of the advantages of random forests are:
+
+It is unexcelled in accuracy among current algorithms. It gives estimates of what variables are important in the classification. There’s no parameter selection involved while random forest may overfit a given data set, just as any other machine learning algorithm, it has been shown by Breiman that classifier variance does not grow with the number of trees used (unlike with Adaboosted decision trees, for example).
+
+Therefore, it’s always better to use more trees, memory and computational power allowing. It generates an internal unbiased estimate of the generalization error as the forest building progresses. It computes proximities between pairs of cases that can be used in clustering, locating outliers, or (by scaling) give interesting views of the data. To do this step, it was used the ‘trainControl’ function from the caret package, which sets and controls some parameters and behaviours in the training process. 
+
+Setup clusters and control parameters:
+```{r training}
+library(parallel)
+library(doParallel)
+
+cl <- makeCluster(detectCores() - 1)
+registerDoParallel(cl)
+ctrl <- trainControl(classProbs=TRUE, savePredictions=TRUE,allowParallel=TRUE)
+```
+
+Let's fit model over the tuning parameters and stop the clusters.
+```{r fitModel}
+method <- "rf"
+system.time(trainingModel <- train(classe ~ ., data=TrainCS, method=method))
+stopCluster(cl)
+```
+# Model Evaluation for training dataset
+```{r evalTraining}
+trainingModel
+hat <- predict(trainingModel, TrainCS)
+confusionMatrix(hat, Train[, classe])
+```
+
+# Model Evaluation for training dataset
+```{r evalProbing}
+hat <- predict(trainingModel, ProbeCS)
+confusionMatrix(hat, ProbeCS[, classe])
+```
+
+# Final Model
+```{r finalM}
+varImp(trainingModel)
+trainingModel$finalModel
+```
+
+The estimated error rate is less than 1%, good enough!
+
+let's save training model object for later.
+```{r saveM}
+save(trainingModel, file="TModel.RData")
+```
+
+## Prediction over Test Data
+Get predictions and evaluate.
+```{r results}
+TestCS <- predict(pp, testing[, candidates, with=FALSE])
+hat <- predict(trainingModel, TestCS)
+testing <- cbind(hat , testing)
+subset(testing, select=names(testing)[grep("belt|[^(fore)]arm|dumbbell|forearm", names(testing), invert=TRUE)])
+```
+
+## Submission to Coursera
+
+Write submission files to `/answers`.
+
+```{r}
+pml_write_files = function(x){
+  n = length(x)
+  path <- "./answers"
+  for(i in 1:n){
+    filename = paste0("problem_id_",i,".txt")
+    write.table(x[i],file=file.path(path, filename),quote=FALSE,row.names=FALSE,col.names=FALSE)
+  }
+}
+pml_write_files(hat)
